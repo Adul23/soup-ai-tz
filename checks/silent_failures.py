@@ -23,13 +23,22 @@ What it does, all numbers into runs/checks/silent_failures.json (no interpretati
     For every item: injected (what), soup_caught (per command: command, exit code, output log,
     report / warning lines, and whether it differs from the same command on the clean copy),
     our_check (what our code measures and its numbers, and whether it flags the item).
+A Soup command that refuses an injected input with an error (e.g. "no causal-loss target
+remains" at max_length 64, ship's "Target modules ... not found") is recorded as soup_caught,
+loud: it is a result, not a crash. For (a) the doctor's counts are copied out as numbers
+(rows_truncated, rows counted by eos_in_labels).
 Exit codes: 0 done; 1 a Soup check failed on the REAL inputs (doctor MAJOR or dry-run non-zero);
-3 one of our checks did not flag an injected failure that had an effect; 4 a step crashed.
+3 one of our checks did not flag an injected failure that had an effect (1 and 3 are findings);
+4 our own code failed unexpectedly (a capture without a Soup error, a merge that did not finish,
+an exception in this script).
+Disk: `df -h` of the repository disk and /tmp is printed before every item. The large
+throw-away copies (injected adapters, their merged models) are written under /tmp and deleted
+right after their comparison; their sha256 stays in the JSON.
 Reads: data/*.jsonl, task/task.yaml, artifacts/adapter/, artifacts/merged/, artifacts/zero_merged/,
 runs/smoke.json (base_weights of the merge).
-Writes: runs/checks/silent_failures.json (+ _<run_id>.json), runs/checks/silent_<run_id>/ (the
-injected copies, Soup reports), logs/silent_*_<run_id>.log. The merged models of the injected
-adapters are deleted after their tensors are compared (disk); their sha256 stays in the JSON.
+Writes: runs/checks/silent_failures.json (+ _<run_id>.json), runs/checks/silent_<run_id>/ (the small
+injected copies: data, tokenizers, configs; Soup reports), logs/silent_*_<run_id>.log,
+/tmp/soup_silent_<run_id>/ (removed at the end).
 Task part: Part 3 (silent failures).
 """
 
@@ -56,6 +65,7 @@ NO_SYSTEM_TEMPLATE = (
     "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\\n' + message['content']"
     " + '<|im_end|>' + '\\n' }}{% endfor %}{% if add_generation_prompt %}"
     "{{ '<|im_start|>assistant\\n' }}{% endif %}")
+TMP_ROOT = "/tmp"
 ITEMS = ("a", "pad_eos", "max_length_64", "dirty_data", "renamed_adapter", "template_no_system")
 
 
@@ -64,7 +74,21 @@ class Ctx:
         self.run_id, self.skip_ship = run_id, skip_ship
         self.dir = OUT_DIR / f"silent_{run_id}"
         self.dir.mkdir(parents=True, exist_ok=True)
+        # Large throw-away copies (merged models, injected adapters) go to /tmp: /kaggle/working
+        # is nearly full after the main chain. Each is deleted right after it has been compared.
+        self.tmp = Path(TMP_ROOT) / f"soup_silent_{run_id}"
+        self.tmp.mkdir(parents=True, exist_ok=True)
         self.crashed = []
+
+
+def disk(where):
+    """Print and return `df -h` of the repository's disk and /tmp before a step."""
+    import subprocess
+
+    paths = [str(REPO)] + [p for p in ("/kaggle/working", TMP_ROOT) if Path(p).exists()]
+    text = subprocess.run(["df", "-h", *dict.fromkeys(paths)], capture_output=True, text=True).stdout
+    log(f"[silent] disk before {where}:\n{text.rstrip()}")
+    return text.splitlines()
 
 
 # ---------------------------------------------------------------- running Soup
@@ -80,7 +104,8 @@ def soup(ctx, name, args, timeout=1800):
     log(f"[silent] soup {' '.join(map(str, args))}")
     code, wall = run_logged(cmd, path, env=dict(ENV, SOUP_DB_PATH=str(ctx.dir / "soup.db")),
                             timeout=timeout)
-    lines = [strip_ts(l) for l in path.read_text(encoding="utf-8", errors="replace").splitlines()[1:-1]]
+    lines = not_ours([strip_ts(l) for l in
+                      path.read_text(encoding="utf-8", errors="replace").splitlines()[1:-1]])
     return {"command": "soup " + " ".join(map(str, args)), "exit_code": code, "wall_s": wall,
             "log": rel(path), "warning_lines": [l for l in lines if WARN.search(l)][:60],
             "output_tail": lines[-25:]}
@@ -152,6 +177,24 @@ def new_lines(clean, dirty, replace=()):
     return sorted(norm(dirty["warning_lines"]) - norm(clean["warning_lines"]))
 
 
+def not_ours(lines):
+    """Drop the lines this script prints itself ([silent] ...): they are not a signal from Soup."""
+    return [l for l in lines if not l.startswith("[silent]")]
+
+
+def soup_error(lines):
+    """Soup's own refusal: the 'Error: ...' line and the lines that continue it."""
+    for i, line in enumerate(lines):
+        if line.startswith("Error:"):
+            block = [line]
+            for nxt in lines[i + 1:i + 6]:
+                if not nxt.strip() or nxt.startswith(("[", "Traceback", "20")):
+                    break
+                block.append(nxt)
+            return " ".join(b.strip() for b in block)
+    return None
+
+
 # ---------------------------------------------------------------- data copies and configs
 
 def write_rows(path, rows):
@@ -182,10 +225,12 @@ def capture(ctx, name, cfg, pad_eos=False):
                              rel(cfg), rel(out), *(["--pad-eos"] if pad_eos else [])], path)
     lines = [strip_ts(l) for l in path.read_text(encoding="utf-8", errors="replace").splitlines()]
     result = read_json(out, {})
-    if code != 0 or not result:
-        ctx.crashed.append(f"capture_{name}")
-    return {"exit_code": code, "wall_s": wall, "log": rel(path), "json": rel(out),
-            "soup_train_warning_lines": [l for l in lines if WARN.search(l)][:60], **result}
+    refusal = soup_error(lines) if code != 0 else None
+    if (code != 0 or not result) and not refusal:
+        ctx.crashed.append(f"capture_{name}")  # our code failed, not a Soup refusal
+    return {"exit_code": code, "wall_s": wall, "log": rel(path), "json": rel(out) if result else None,
+            "soup_refused": refusal,
+            "soup_train_warning_lines": not_ours([l for l in lines if WARN.search(l)])[:60], **result}
 
 
 def inner_capture(cfg, out, pad_eos):
@@ -267,6 +312,20 @@ def item_a(ctx, train_rows):
            "data_doctor": doctor(ctx, "real", DATA / "train.jsonl", sample=len(train_rows)),
            "train_dry_run": dry_run(ctx, "real", REPO / "task" / "task.yaml"),
            "ship": ship(ctx, "real", ARTIFACTS / "adapter")}
+    checks = out["data_doctor"]["checks"]
+
+    def fraction(check):
+        m = re.search(r"(\d+)/(\d+) rows", (checks.get(check) or {}).get("message", ""))
+        return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+    truncated, scanned = fraction("truncation_risk")
+    no_eos, eos_rows = fraction("eos_in_labels")
+    out["real_data_numbers"] = {
+        "source": out["data_doctor"]["report"],
+        "rows_total": len(train_rows),
+        "rows_truncated": truncated, "truncation_rows_scanned": scanned,
+        "eos_in_labels_rows_without_eos": no_eos, "eos_in_labels_rows_counted": eos_rows,
+        "rows_not_counted_by_eos_in_labels": None if eos_rows is None else len(train_rows) - eos_rows,
+    }
     out["failed_on_real_inputs"] = (out["data_doctor"]["exit_code"] != 0
                                     or out["data_doctor"]["overall"] == "MAJOR"
                                     or out["train_dry_run"]["exit_code"] != 0)
@@ -322,11 +381,25 @@ def item_max_length(ctx, clean_data, clean_cap, clean_doc, clean_dry):
     doc = doctor(ctx, "max_length_64", clean_data, max_length=64)
     dry = dry_run(ctx, "max_length_64", cfg)
     ds = cap.get("train_dataset", {})
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    lengths = []
+    for row in read_jsonl(clean_data):
+        user = [{"role": "user", "content": user_turn(row)}]
+        text = tok.apply_chat_template(user + [{"role": "assistant", "content": row["output"]}],
+                                       tokenize=False)
+        lengths.append(len(tok(text.rstrip("\n"), add_special_tokens=False)["input_ids"]))
+    cut = sum(n > 64 for n in lengths)  # the last token of the row is the answer's <|im_end|>
     return {
         "injected": "data.max_length 64 (task.yaml has 512) on the 50-row copy",
         "soup_caught": {
-            "any": compare_doctor(clean_doc, doc)["caught"] or dry["exit_code"] != clean_dry["exit_code"]
+            "any": bool(cap.get("soup_refused")) or compare_doctor(clean_doc, doc)["caught"]
+                   or dry["exit_code"] != clean_dry["exit_code"]
                    or bool(train_log_new(clean_cap, cap, "max_length_64")),
+            "loud": bool(cap.get("soup_refused")),
+            "soup_train": {"log": cap.get("log"), "exit_code": cap.get("exit_code"),
+                           "refused": cap.get("soup_refused")},
             "data_doctor": {**doc, **compare_doctor(clean_doc, doc)},
             "train_dry_run": {**dry, "caught": dry["exit_code"] != clean_dry["exit_code"],
                               "new_warning_lines_vs_clean": new_lines(clean_dry, dry, ("max_length_64", "clean"))},
@@ -334,15 +407,15 @@ def item_max_length(ctx, clean_data, clean_cap, clean_doc, clean_dry):
                                "new_warning_lines_vs_clean": train_log_new(clean_cap, cap, "max_length_64")},
             "ship": {"not_run": "ship evaluates a trained adapter; this fault is in training"}},
         "our_check": {
-            "what": "Soup's tokenized set: share of rows whose answer <|im_end|> is cut off "
-                    "(absent from input_ids after the assistant header)",
-            "clean": clean_cap.get("train_dataset"),
-            "injected": ds,
-            "im_end_cut_share": share(ds.get("rows_im_end_cut", 0), ds.get("rows")),
-            "no_loss_tokens_share": share(ds.get("rows_without_loss_tokens", 0), ds.get("rows")),
-            "trainer_max_length": cap.get("trainer_max_length"),
-            "effect_present": bool(ds.get("rows_im_end_cut")),
-            "flags": bool(ds.get("rows_im_end_cut")),
+            "what": "rows of the copy whose full chat-template rendering (up to the answer's "
+                    "<|im_end|>) is longer than 64 tokens, i.e. whose <|im_end|> is cut; counted with "
+                    "the tokenizer, so it does not need Soup's tokenized set (Soup refused to build it)",
+            "rows": len(lengths), "rows_im_end_cut": cut,
+            "im_end_cut_share": share(cut, len(lengths)),
+            "length_p50_p100": [sorted(lengths)[len(lengths) // 2], max(lengths)] if lengths else None,
+            "soup_tokenized_set": ds or None,
+            "effect_present": cut > 0,
+            "flags": cut > 0,
         },
         "capture": cap.get("json"),
     }
@@ -441,7 +514,8 @@ def item_renamed_adapter(ctx, base_weights):
     targets = [targets] if isinstance(targets, str) else list(targets)
     out = {"injected": {}, "soup_caught": {}, "our_check": {}}
 
-    keys_dir = ctx.dir / "adapter_renamed_keys"
+    disk("renamed_adapter")
+    keys_dir = ctx.tmp / "adapter_renamed_keys"
     shutil.copytree(src, keys_dir)
     tensors = load_file(str(src / "adapter_model.safetensors"))
     renamed = {}
@@ -450,20 +524,22 @@ def item_renamed_adapter(ctx, base_weights):
             k = k.replace(f".{t}.", f".{t}_renamed.")
         renamed[k] = v.contiguous()
     save_file(renamed, str(keys_dir / "adapter_model.safetensors"), metadata={"format": "pt"})
-    cfg_dir = ctx.dir / "adapter_renamed_config"
+    cfg_dir = ctx.tmp / "adapter_renamed_config"
     shutil.copytree(src, cfg_dir)
     acfg = read_json(cfg_dir / "adapter_config.json")
     acfg["target_modules"] = [f"{t}_renamed" for t in targets]
     write_json(cfg_dir / "adapter_config.json", acfg)
     out["injected"] = {
-        "keys": f"adapter_model.safetensors keys .{targets} -> ._renamed (adapter_config unchanged): "
-                + rel(keys_dir),
-        "config": f"adapter_config.json target_modules -> {acfg['target_modules']} (weights unchanged): "
-                  + rel(cfg_dir)}
+        "keys": f"adapter_model.safetensors keys .{targets} -> ._renamed (adapter_config unchanged)",
+        "config": f"adapter_config.json target_modules -> {acfg['target_modules']} (weights unchanged)",
+        "copies": {"keys": {"path": str(keys_dir), "sha256": dir_sha256(keys_dir)},
+                   "config": {"path": str(cfg_dir), "sha256": dir_sha256(cfg_dir)},
+                   "deleted_after_check": True}}
 
     ref_diff = tensor_diff(ARTIFACTS / "merged", reference, targets)
     for variant, adapter in (("keys", keys_dir), ("config", cfg_dir)):
-        merged = ARTIFACTS / f"silent_merged_{variant}_{ctx.run_id}"
+        merged = ctx.tmp / f"merged_{variant}"
+        disk(f"merge of the {variant}-renamed adapter")
         path = LOGS / f"silent_merge_{variant}_{ctx.run_id}.log"
         code, wall = run_logged([sys.executable, "harness/merge.py", "--base-weights", base_weights,
                                  "--adapter", rel(adapter), "--out", rel(merged),
@@ -474,9 +550,20 @@ def item_renamed_adapter(ctx, base_weights):
         sha = dir_sha256(merged)
         if merged.is_dir():
             shutil.rmtree(merged)
+        peft_warning = next((l for l in lines if "missing adapter keys" in l), None)
+        if code != 0 and not any("rror" in l and "peft" in l.lower() or "Target modules" in l
+                                 for l in lines):
+            ctx.crashed.append(f"merge_{variant}")  # e.g. disk full: our step failed, nothing measured
         out["our_check"][variant] = {
             "merge_exit_code": code, "merge_wall_s": wall, "merge_log": rel(path),
+            "merge_error": next((l for l in reversed(lines) if "Error" in l), None) if code else None,
             "merge_warning_lines": [l for l in lines if WARN.search(l)][:30],
+            "identical": None if diff is None else (diff["targets"]["changed"] == 0
+                                                    and diff["other"]["changed"] == 0
+                                                    and not diff["names_only_in_one"]),
+            "peft_missing_keys_warning": peft_warning[:4000] if peft_warning else None,
+            "only_signal": ("the peft UserWarning above; merge exit 0 and the model saved"
+                            if code == 0 and peft_warning else None),
             "lora_modules_merged": step.get("lora_modules_merged"),
             "vs_zero_merged": diff, "merged_sha256": sha, "merged_deleted_after_check": True,
             "merged_equals_base": (diff is not None and diff["targets"]["changed"] == 0
@@ -484,6 +571,7 @@ def item_renamed_adapter(ctx, base_weights):
             "effect_present": code == 0 and diff is not None and diff["targets"]["changed"] == 0,
             "flags": code != 0 or (diff is not None and diff["targets"]["changed"] == 0)}
         out["soup_caught"][f"ship_{variant}"] = ship(ctx, f"renamed_{variant}", adapter)
+        shutil.rmtree(adapter, ignore_errors=True)
     out["our_check"]["what"] = ("harness/merge.py on the injected adapter, then every tensor compared "
                                 "with artifacts/zero_merged (B = 0 merge = base); flags when no "
                                 "LoRA-target tensor changed (or the merge failed)")
@@ -493,9 +581,14 @@ def item_renamed_adapter(ctx, base_weights):
     out["our_check"]["effect_present"] = any(out["our_check"][v]["effect_present"] for v in ("keys", "config"))
     out["soup_caught"]["data_doctor"] = {"not_run": "data doctor checks data, not an adapter"}
     out["soup_caught"]["train_dry_run"] = {"not_run": "pre-flight checks a training config, not an adapter"}
-    out["soup_caught"]["any"] = any(s.get("exit_code") not in (None, 0) and s.get("exit_code") != 2
-                                    or s.get("caught") for s in out["soup_caught"].values()
+    for s in out["soup_caught"].values():  # ship: exit 1 = refused to run (loud), 2 = a verdict
+        if isinstance(s, dict) and s.get("command"):
+            s["caught"] = s.get("exit_code") not in (0, 2)
+            s["refused"] = soup_error(s.get("output_tail", [])) if s["caught"] else None
+    out["soup_caught"]["any"] = any(s.get("caught") for s in out["soup_caught"].values()
                                     if isinstance(s, dict))
+    out["soup_caught"]["by_variant"] = {v: bool(out["soup_caught"].get(f"ship_{v}", {}).get("caught"))
+                                        for v in ("keys", "config")}
     out["soup_caught"]["note"] = ("ship exit 2 = DON'T SHIP is a verdict, not a detected fault; "
                                   "compare its verdict_json with item a's ship on the real adapter")
     return out
@@ -629,6 +722,7 @@ def main():
     }
     for name in only:
         log(f"[silent] ==== {name}")
+        disk(name)
         try:
             result["items"][name] = steps[name]()
         except Exception as exc:  # recorded, then the run goes on; exit 4 at the end
@@ -652,6 +746,7 @@ def main():
             "train_dry_run_exit_code": items["a"]["train_dry_run"]["exit_code"],
             "ship_verdict": items["a"]["ship"].get("verdict"),
             "failed_on_real_inputs": items["a"]["failed_on_real_inputs"]}
+    shutil.rmtree(ctx.tmp, ignore_errors=True)
     missed = [n for n, s in result["summary"].items()
               if n != "a" and s["effect_present"] and not s["our_check_flags"]]
     result["our_check_missed"] = missed
