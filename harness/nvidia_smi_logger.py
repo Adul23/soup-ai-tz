@@ -25,11 +25,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", required=True)
     parser.add_argument("--interval-ms", type=int, default=200)
+    parser.add_argument("--gpu", type=int, default=None, help="only this GPU (nvidia-smi -i)")
     args = parser.parse_args()
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(["nvidia-smi", f"--query-gpu={FIELDS}", "--format=csv,noheader,nounits",
+    only = ["-i", str(args.gpu)] if args.gpu is not None else []
+    proc = subprocess.Popen(["nvidia-smi", *only, f"--query-gpu={FIELDS}", "--format=csv,noheader,nounits",
                              "-lms", str(args.interval_ms)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 

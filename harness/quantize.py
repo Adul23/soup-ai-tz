@@ -17,8 +17,22 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import (ARTIFACTS, LOGS, STEPS, SmiLogger, bnb_nf4_config, dir_sha256, dir_size_mib,  # noqa: E402
-                    log, must_not_exist, new_run_id, rel, run_record, torch_peaks, write_json)
+from common import (
+    ARTIFACTS,
+    LOGS,
+    STEPS,
+    SmiLogger,
+    bnb_nf4_config,
+    dir_sha256,
+    dir_size_mib,
+    log,
+    must_not_exist,
+    new_run_id,
+    rel,
+    run_record,
+    torch_peaks,
+    write_json,
+)
 
 
 def main():
@@ -40,8 +54,12 @@ def main():
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     with SmiLogger(LOGS / f"nvidia_smi_quantize_{run_id}.csv") as smi:
-        model = AutoModelForCausalLM.from_pretrained(str(merged), dtype=torch.float16,
-                                                     quantization_config=config, device_map={"": 0})
+        model = AutoModelForCausalLM.from_pretrained(
+            str(merged),
+            dtype=torch.float16,
+            quantization_config=config,
+            device_map={"": 0},
+        )
         kinds = {}
         for _name, module in model.named_modules():
             if not list(module.children()):
@@ -52,16 +70,28 @@ def main():
         torch.cuda.synchronize()
     wall = round(time.perf_counter() - started, 2)
 
-    result = {"step": "quantize", "run_id": run_id, "exit_code": 0, "wall_s": wall,
-              "merged": rel(merged), "out": rel(out), "bnb_config": config.to_dict(),
-              "leaf_module_types": kinds,
-              "memory_footprint_mib": round(model.get_memory_footprint() / 2**20, 1),
-              "out_size_mib": dir_size_mib(out), "out_sha256": dir_sha256(out),
-              **smi.summary(), **torch_peaks(torch), **run_record()}
+    result = {
+        "step": "quantize",
+        "run_id": run_id,
+        "exit_code": 0,
+        "wall_s": wall,
+        "merged": rel(merged),
+        "out": rel(out),
+        "bnb_config": config.to_dict(),
+        "leaf_module_types": kinds,
+        "memory_footprint_mib": round(model.get_memory_footprint() / 2**20, 1),
+        "out_size_mib": dir_size_mib(out),
+        "out_sha256": dir_sha256(out),
+        **smi.summary(),
+        **torch_peaks(torch),
+        **run_record(),
+    }
     result["bnb_config"] = {k: str(v) for k, v in result["bnb_config"].items()}
     write_json(STEPS / f"quantize_{run_id}.json", result)
-    log(f"[quantize] done in {wall} s, layers {kinds}, {result['out_size_mib']} MiB on disk, "
-        f"nvidia-smi peak {smi.peak_mib} MiB, torch allocated {result['torch_max_allocated_mib']} MiB")
+    log(
+        f"[quantize] done in {wall} s, layers {kinds}, {result['out_size_mib']} MiB on disk, "
+        f"nvidia-smi peak {smi.peak_mib} MiB, torch allocated {result['torch_max_allocated_mib']} MiB"
+    )
 
 
 if __name__ == "__main__":

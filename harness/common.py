@@ -66,7 +66,7 @@ def must_not_exist(path):
         sys.exit(f"{path} already exists; refusing to overwrite it. Move it away or use a new path.")
 
 
-def run_logged(cmd, log_path, env=None, echo=True, timeout=None):
+def run_logged(cmd, log_path, env=None, echo=True, timeout=None, echo_prefix=""):
     """Run `cmd` from the repository root in its own process group. Every output line goes to
     `log_path` prefixed with a UTC timestamp (and to stdout if `echo`). Returns (exit code,
     wall seconds). A failed run keeps its log. With `timeout` (s) the process group is killed
@@ -89,7 +89,7 @@ def run_logged(cmd, log_path, env=None, echo=True, timeout=None):
                 handle.write(stamped + "\n")
                 handle.flush()
                 if echo:
-                    print(stamped, flush=True)
+                    print(echo_prefix + stamped, flush=True)
             code = proc.wait()
         except KeyboardInterrupt:
             kill_group(proc)
@@ -107,17 +107,20 @@ def run_logged(cmd, log_path, env=None, echo=True, timeout=None):
 class SmiLogger:
     """Runs harness/nvidia_smi_logger.py in the background while the block runs. After the
     block: `peak_mib` is the highest memory.used of any sample, `baseline_mib` the first sample
-    (memory already in use before the work started)."""
+    (memory already in use before the work started). With `gpu`, only that physical GPU
+    (nvidia-smi index) is counted, for runs that share the machine with another process."""
 
-    def __init__(self, path, interval_ms=SMI_INTERVAL_MS):
-        self.path, self.interval_ms = Path(path), interval_ms
+    def __init__(self, path, interval_ms=SMI_INTERVAL_MS, gpu=None):
+        self.path, self.interval_ms, self.gpu = Path(path), interval_ms, gpu
         self.peak_mib = self.baseline_mib = self.samples = None
 
     def __enter__(self):
         must_not_exist(self.path)
         self.proc = subprocess.Popen(
             [sys.executable, str(REPO / "harness" / "nvidia_smi_logger.py"), "--out", str(self.path),
-             "--interval-ms", str(self.interval_ms)], env=ENV, start_new_session=True)
+             "--interval-ms", str(self.interval_ms),
+             *(["--gpu", str(self.gpu)] if self.gpu is not None else [])],
+            env=ENV, start_new_session=True)
         time.sleep(1.0)  # let the first samples land before the work starts
         return self
 
@@ -129,31 +132,41 @@ class SmiLogger:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 kill_group(self.proc)
-        self.peak_mib, self.baseline_mib, self.samples = smi_peak(self.path)
+        self.peak_mib, self.baseline_mib, self.samples = smi_peak(self.path, self.gpu)
         return False
 
     def summary(self):
-        return {"nvidia_smi_log": rel(self.path), "nvidia_smi_peak_mib": self.peak_mib,
+        return {"nvidia_smi_log": rel(self.path), "nvidia_smi_gpu": self.gpu,
+                "nvidia_smi_peak_mib": self.peak_mib,
                 "nvidia_smi_baseline_mib": self.baseline_mib, "nvidia_smi_samples": self.samples}
 
 
-def smi_peak(path):
-    """(peak MiB, first-sample MiB, sample count) of a nvidia_smi_logger.py file, summed over
-    the GPUs of each sample."""
-    totals = {}
+def smi_peak(path, gpu=None):
+    """(peak MiB, first-sample MiB, sample count) of a nvidia_smi_logger.py file. A sample is
+    one line per GPU (nvidia-smi prints the GPUs of one sample in index order, each line with
+    its own timestamp); memory is summed over the GPUs of a sample, or only GPU `gpu`."""
+    samples, current, first_index = [], {}, None
     try:
         with open(path, encoding="utf-8") as handle:
             for line in handle:
                 parts = [part.strip() for part in line.split(",")]
-                if len(parts) < 3 or not parts[2].isdigit():
+                if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
                     continue
-                totals.setdefault(parts[0], 0)
-                totals[parts[0]] += int(parts[2])
+                index, used = int(parts[1]), int(parts[2])
+                if first_index is None:
+                    first_index = index
+                if index == first_index and current:
+                    samples.append(current)
+                    current = {}
+                current[index] = used
     except OSError:
         return None, None, 0
-    if not totals:
+    if current:
+        samples.append(current)
+    values = [s.get(gpu) if gpu is not None else sum(s.values()) for s in samples]
+    values = [v for v in values if v is not None]
+    if not values:
         return None, None, 0
-    values = list(totals.values())
     return max(values), values[0], len(values)
 
 

@@ -21,8 +21,23 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import (ARTIFACTS, LOGS, REPO, STEPS, SmiLogger, dir_sha256, dir_size_mib, log,  # noqa: E402
-                    must_not_exist, new_run_id, read_json, rel, run_logged, run_record, write_json)
+from common import (
+    ARTIFACTS,
+    LOGS,
+    REPO,
+    STEPS,
+    SmiLogger,
+    dir_sha256,
+    dir_size_mib,
+    log,
+    must_not_exist,
+    new_run_id,
+    read_json,
+    rel,
+    run_logged,
+    run_record,
+    write_json,
+)
 
 
 def main():
@@ -43,10 +58,15 @@ def main():
 
     result = {"step": "train", "run_id": run_id}
     if not args.skip_prepare:
-        code, wall = run_logged([sys.executable, "task/prepare_data.py"],
-                                LOGS / f"prepare_data_{run_id}.log")
-        result["prepare_data"] = {"exit_code": code, "wall_s": wall,
-                                  "log": rel(LOGS / f"prepare_data_{run_id}.log")}
+        code, wall = run_logged(
+            [sys.executable, "task/prepare_data.py"],
+            LOGS / f"prepare_data_{run_id}.log",
+        )
+        result["prepare_data"] = {
+            "exit_code": code,
+            "wall_s": wall,
+            "log": rel(LOGS / f"prepare_data_{run_id}.log"),
+        }
         if code != 0:
             write_json(out_json, {**result, "exit_code": code, **run_record()})
             sys.exit(f"prepare_data failed (exit {code})")
@@ -54,34 +74,61 @@ def main():
     config = yaml.safe_load((REPO / "task" / "task.yaml").read_text(encoding="utf-8"))
     config["output"] = "./" + rel(adapter)
     config_path = LOGS / f"train_{run_id}.yaml"
-    config_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
-                           encoding="utf-8")
+    config_path.write_text(
+        yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
     seed = config["training"].get("seed")
-    log(f"[run_train] {run_id}: soup train, config {rel(config_path)}, adapter -> {rel(adapter)}")
+    log(
+        f"[run_train] {run_id}: soup train, config {rel(config_path)}, adapter -> {rel(adapter)}"
+    )
 
     inproc_json = STEPS / f"soup_train_{run_id}.json"
     with SmiLogger(LOGS / f"nvidia_smi_train_{run_id}.csv") as smi:
-        code, wall = run_logged([sys.executable, "harness/soup_train_inproc.py",
-                                 "--config", rel(config_path), "--out", rel(inproc_json)], train_log)
+        code, wall = run_logged(
+            [
+                sys.executable,
+                "harness/soup_train_inproc.py",
+                "--config",
+                rel(config_path),
+                "--out",
+                rel(inproc_json),
+            ],
+            train_log,
+        )
     inner = read_json(inproc_json, {})
-    losses = [entry["loss"] for entry in inner.get("log_history", []) if "loss" in entry]
-    result.update({
-        "exit_code": code, "wall_s": wall, "log": rel(train_log), "config": rel(config_path),
-        "config_used": config, **smi.summary(),
-        "torch_max_allocated_mib": inner.get("torch_max_allocated_mib"),
-        "torch_max_reserved_mib": inner.get("torch_max_reserved_mib"),
-        "cuda_device": inner.get("cuda_device"), "device_count": inner.get("device_count"),
-        "soup_compute_dtype": inner.get("soup_compute_dtype"),
-        "trainer": inner.get("trainer"), "max_steps": inner.get("max_steps"),
-        "logged_steps": len(losses), "first_loss": losses[0] if losses else None,
-        "last_loss": losses[-1] if losses else None,
-        "adapter": rel(adapter), "adapter_size_mib": dir_size_mib(adapter),
-        "adapter_sha256": dir_sha256(adapter), "inproc_json": rel(inproc_json),
-        **run_record(seed),
-    })
+    losses = [
+        entry["loss"] for entry in inner.get("log_history", []) if "loss" in entry
+    ]
+    result.update(
+        {
+            "exit_code": code,
+            "wall_s": wall,
+            "log": rel(train_log),
+            "config": rel(config_path),
+            "config_used": config,
+            **smi.summary(),
+            "torch_max_allocated_mib": inner.get("torch_max_allocated_mib"),
+            "torch_max_reserved_mib": inner.get("torch_max_reserved_mib"),
+            "cuda_device": inner.get("cuda_device"),
+            "device_count": inner.get("device_count"),
+            "soup_compute_dtype": inner.get("soup_compute_dtype"),
+            "trainer": inner.get("trainer"),
+            "max_steps": inner.get("max_steps"),
+            "logged_steps": len(losses),
+            "first_loss": losses[0] if losses else None,
+            "last_loss": losses[-1] if losses else None,
+            "adapter": rel(adapter),
+            "adapter_size_mib": dir_size_mib(adapter),
+            "adapter_sha256": dir_sha256(adapter),
+            "inproc_json": rel(inproc_json),
+            **run_record(seed),
+        }
+    )
     write_json(out_json, result)
-    log(f"[run_train] exit {code}, {wall} s, nvidia-smi peak {smi.peak_mib} MiB, torch allocated "
-        f"{result['torch_max_allocated_mib']} MiB, loss {result['first_loss']} -> {result['last_loss']}")
+    log(
+        f"[run_train] exit {code}, {wall} s, nvidia-smi peak {smi.peak_mib} MiB, torch allocated "
+        f"{result['torch_max_allocated_mib']} MiB, loss {result['first_loss']} -> {result['last_loss']}"
+    )
     if code != 0 or not (adapter / "adapter_config.json").exists():
         sys.exit(f"training failed (exit {code}); see {rel(train_log)}")
 

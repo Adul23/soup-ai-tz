@@ -9,6 +9,12 @@ Apache-2.0); the only change is a two-line header naming their source. tests/con
 adapted from Soup v0.77.0's tests/conftest.py: a subset of its fixtures plus a hook that applies
 the solution.
 
+kernels/swiglu.py is the example SwiGLU kernel of the Soup Kernel Challenge starter kit
+(Copyright 2026 Makazhan Alpamys and the Soup contributors, Apache License 2.0), copied via
+justdoner/solution/swiglu.py; the only change is a launch counter (STATS). It is not our code.
+kernels/head.py, kernels/mlp_fp16.py and their tests are our own code from the same hackathon
+repository (justdoner/solution/), used only in the separate memory experiment.
+
 Task data: AmanMussa/kazakh-instruction-v2 on Hugging Face (MIT on its card), a Kazakh translation
 of Stanford Alpaca (tatsu-lab/alpaca, CC BY-NC 4.0). It is downloaded at run time, not shipped here.
 Model: Qwen/Qwen2.5-1.5B-Instruct on Hugging Face, Apache-2.0 license.
