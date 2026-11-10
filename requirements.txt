@@ -5,5 +5,8 @@ peft==0.20.0
 trl==0.29.1
 bitsandbytes==0.50.2
 accelerate==1.14.0
+# peft 0.20 refuses to load an adapter when an older torchao (< 0.16) is installed; some Kaggle
+# images ship torchao 0.10.0. 0.18.0 is the version of the first successful run (torch 2.11.0+cu130).
+torchao==0.18.0
 # TODO: pin pytest (justdoner/README.md installs it without a version).
 pytest

@@ -50,9 +50,16 @@ def main():
         choices=("fp16", "nf4-dequant"),
         help="what merge.py merges into; no default on purpose",
     )
+    parser.add_argument(
+        "--resume",
+        metavar="RUN_ID",
+        default=None,
+        help="continue that run: steps whose step JSON says exit 0 are taken as they are, "
+        "the rest run again (their earlier logs are kept, new output is appended)",
+    )
     args = parser.parse_args()
 
-    run_id = new_run_id()
+    run_id = args.resume or new_run_id()
     py = sys.executable
     steps = [
         ("train", [py, "harness/run_train.py", "--run-id", run_id]),
@@ -78,13 +85,19 @@ def main():
     }
     for name, cmd in steps:
         console = LOGS / f"{name}_console_{run_id}.log"
-        log(f"[smoke] {name}: {' '.join(cmd[1:])}")
-        code, wall = run_logged(cmd, console)
         step = read_json(STEPS / f"{name}_{run_id}.json", {})
+        if args.resume and step.get("exit_code") == 0:
+            log(f"[smoke] {name}: done in run {run_id}, taken from its step JSON")
+            code, wall = 0, None
+        else:
+            log(f"[smoke] {name}: {' '.join(cmd[1:])}")
+            code, wall = run_logged(cmd, console)
+            step = read_json(STEPS / f"{name}_{run_id}.json", {})
         summary["steps"][name] = {
             **{k: step.get(k) for k in KEEP},
             "exit_code": code,
             "process_wall_s": wall,
+            "taken_from_earlier_attempt": wall is None,
             "console_log": rel(console),
             "step_json": rel(STEPS / f"{name}_{run_id}.json"),
         }
