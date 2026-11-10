@@ -66,10 +66,13 @@ def must_not_exist(path):
         sys.exit(f"{path} already exists; refusing to overwrite it. Move it away or use a new path.")
 
 
-def run_logged(cmd, log_path, env=None, echo=True):
+def run_logged(cmd, log_path, env=None, echo=True, timeout=None):
     """Run `cmd` from the repository root in its own process group. Every output line goes to
     `log_path` prefixed with a UTC timestamp (and to stdout if `echo`). Returns (exit code,
-    wall seconds). A failed run keeps its log."""
+    wall seconds). A failed run keeps its log. With `timeout` (s) the process group is killed
+    after that long and the exit code is -9."""
+    import threading
+
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     with open(log_path, "a", encoding="utf-8") as handle:
@@ -77,6 +80,9 @@ def run_logged(cmd, log_path, env=None, echo=True):
         proc = subprocess.Popen([str(part) for part in cmd], cwd=REPO, env=env or ENV,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 errors="replace", bufsize=1, start_new_session=True)
+        timer = threading.Timer(timeout, kill_group, args=(proc,)) if timeout else None
+        if timer:
+            timer.start()
         try:
             for line in proc.stdout:
                 stamped = f"{now_iso()} {line.rstrip()}"
@@ -88,7 +94,12 @@ def run_logged(cmd, log_path, env=None, echo=True):
         except KeyboardInterrupt:
             kill_group(proc)
             raise
+        finally:
+            if timer:
+                timer.cancel()
         wall = round(time.perf_counter() - started, 2)
+        if timeout and code == -9:
+            handle.write(f"{now_iso()} TIMEOUT after {timeout} s\n")
         handle.write(f"{now_iso()} exit code {code}, {wall} s\n")
     return code, wall
 
